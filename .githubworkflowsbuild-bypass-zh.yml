@@ -1,0 +1,266 @@
+name: RAX3000M NAND Chinese Bypass Mesh
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-bypass-zh.yml']
+permissions:
+  contents: write
+concurrency:
+  group: rax3000m-bypass-zh
+  cancel-in-progress: true
+env:
+  TZ: Asia/Shanghai
+  CARGO_BUILD_JOBS: '2'
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang llvm libclang-dev lld cmake ninja-build flex bison g++-multilib gcc-multilib gawk gettext git libncurses-dev libssl-dev python3-setuptools rsync swig unzip zlib1g-dev file wget curl libelf-dev dwarves libzstd-dev zstd pkg-config protobuf-compiler
+          df -h
+      - name: Checkout current upstream and official packages
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch 25.12 https://github.com/chasey-dev/immortalwrt-mt798x-rebase openwrt
+          git clone --depth 1 https://github.com/daeuniverse/openwrt-packages dae-feed
+          HONK_TAG=$(sed -n 's/^HONK_GIT_TAG:=.*,[[:space:]]*\([^,)]*\))$/\1/p' dae-feed/honk/Makefile)
+          test -n "$HONK_TAG"
+          git clone --depth 1 --branch "$HONK_TAG" https://github.com/daeuniverse/honk dae-feed/honk/src
+          mkdir -p dist
+          for d in openwrt dae-feed dae-feed/honk/src; do
+            printf '%s ' "$d" >> dist/source-commits.txt
+            git -C "$d" rev-parse HEAD >> dist/source-commits.txt
+          done
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          for p in dae honk luci-app-dae luci-app-honk luci-lib-daeuniverse vmlinux-btf vmlinux-btf-builtin; do
+            find package/feeds -type l -name "$p" -delete
+          done
+          mkdir -p package/daeuniverse
+          for p in honk luci-app-honk luci-lib-daeuniverse vmlinux-btf-builtin; do
+            cp -a "../dae-feed/$p" package/daeuniverse/
+          done
+      - name: Prepare Rust and bpf-linker
+        run: |
+          set -euxo pipefail
+          source "$HOME/.cargo/env"
+          stable=$(python3 -c 'import tomllib; print(tomllib.load(open("dae-feed/honk/src/rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          nightly=$(python3 -c 'import tomllib; print(tomllib.load(open("dae-feed/honk/src/crates/honk-ebpf/rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$stable" --profile minimal
+          rustup target add --toolchain "$stable" aarch64-unknown-linux-musl
+          rustup toolchain install "$nightly" --profile minimal --component rust-src
+          version=$(sed -n 's/^BPF_LINKER_VERSION=//p' dae-feed/honk/src/.github/ci/pins.env)
+          test "$version" = '0.11.0' || { echo "Unreviewed bpf-linker version: $version"; exit 1; }
+          archive="$RUNNER_TEMP/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          curl --fail --location --retry 3 --output "$archive" 'https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst'
+          printf '%s  %s\n' '10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450' "$archive" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/bpf-linker-unpack" "$HOME/.cargo/bin"
+          tar --zstd -xf "$archive" -C "$RUNNER_TEMP/bpf-linker-unpack"
+          linker=$(find "$RUNNER_TEMP/bpf-linker-unpack" -type f -name bpf-linker -print -quit)
+          test -n "$linker"
+          install -m 0755 "$linker" "$HOME/.cargo/bin/bpf-linker"
+          "$HOME/.cargo/bin/bpf-linker" --version
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Generate Chinese bypass + mesh configuration
+        env:
+          WIFI_KEY: ${{ secrets.WIFI_KEY }}
+        run: |
+          set -euxo pipefail
+          cd openwrt
+          cat > .config <<'EOF'
+          CONFIG_TARGET_mediatek=y
+          CONFIG_TARGET_mediatek_filogic=y
+          CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m=y
+          CONFIG_ALL_NONSHARED=n
+          CONFIG_ALL_KMODS=n
+          CONFIG_LUCI_LANG_zh_Hans=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-compat=y
+          CONFIG_PACKAGE_luci-theme-argon=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-package-manager-zh-cn=y
+          # CONFIG_PACKAGE_dae is not set
+          CONFIG_PACKAGE_honk=y
+          # CONFIG_PACKAGE_luci-app-dae is not set
+          CONFIG_PACKAGE_luci-app-honk=y
+          CONFIG_PACKAGE_luci-lib-daeuniverse=y
+          CONFIG_PACKAGE_luci-i18n-daeuniverse-zh-cn=y
+          CONFIG_PACKAGE_vmlinux-btf-builtin=y
+          CONFIG_PACKAGE_usteer=y
+          CONFIG_PACKAGE_luci-app-usteer=y
+          CONFIG_PACKAGE_luci-i18n-usteer-zh-cn=y
+          CONFIG_PACKAGE_kmod-sched-bpf=y
+          CONFIG_PACKAGE_kmod-veth=y
+          CONFIG_PACKAGE_kmod-nft-queue=y
+          CONFIG_PACKAGE_kmod-nfnetlink-queue=y
+          CONFIG_PACKAGE_v2ray-geoip=y
+          CONFIG_PACKAGE_v2ray-geosite=y
+          CONFIG_PACKAGE_ca-bundle=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_htop=y
+          CONFIG_PACKAGE_ip-full=y
+          CONFIG_PACKAGE_tc-full=y
+          # CONFIG_PACKAGE_tc-tiny is not set
+          CONFIG_KERNEL_CGROUPS=y
+          CONFIG_KERNEL_MEMCG=y
+          CONFIG_KERNEL_CGROUP_BPF=y
+          CONFIG_KERNEL_BPF_SYSCALL=y
+          CONFIG_KERNEL_BPF_JIT=y
+          CONFIG_KERNEL_DEBUG_INFO=y
+          # CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set
+          CONFIG_KERNEL_DEBUG_INFO_BTF=y
+          CONFIG_INCLUDE_CONFIG=y
+          EOF
+          cat ../features/10-mtwifi.configfrag >> .config
+          make defconfig
+          for p in honk luci-app-honk luci-theme-argon luci-i18n-daeuniverse-zh-cn vmlinux-btf-builtin usteer luci-app-usteer; do
+            grep -qx "CONFIG_PACKAGE_$p=y" .config || { echo "Missing required package: $p"; exit 1; }
+          done
+          if grep -Eq '^CONFIG_PACKAGE_(dae|luci-app-dae)=[ym]$' .config; then
+            echo 'Unexpected dae package selected'; exit 1
+          fi
+          grep -qx 'CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config
+          mkdir -p files/etc/uci-defaults files/etc/sysctl.d
+          cat > files/etc/uci-defaults/99zz-bypass-zh <<'EOF'
+          #!/bin/sh
+          [ -n "$IPKG_INSTROOT" ] && exit 0
+          uci set network.lan.proto='static'
+          uci set network.lan.ipaddr='192.168.0.2'
+          uci set network.lan.netmask='255.255.255.0'
+          uci set network.lan.gateway='192.168.0.1'
+          uci -q delete network.lan.dns
+          uci add_list network.lan.dns='192.168.0.1'
+          uci -q delete network.lan.ip6assign
+          uci -q delete network.globals.ula_prefix
+          uci -q delete network.wan6
+          uci set network.lan.delegate='0'
+          uci set network.lan.ipv6='0'
+          uci -q set network.wan.auto='0'
+          uci commit network
+          uci set dhcp.lan.ignore='1'
+          uci set dhcp.lan.ra='disabled'
+          uci set dhcp.lan.dhcpv6='disabled'
+          uci set dhcp.lan.ndp='disabled'
+          uci set dhcp.@dnsmasq[0].noresolv='1'
+          uci -q delete dhcp.@dnsmasq[0].server
+          uci add_list dhcp.@dnsmasq[0].server='192.168.0.1'
+          uci commit dhcp
+          uci set luci.main.lang='zh_cn'
+          uci set luci.main.mediaurlbase='/luci-static/argon'
+          uci commit luci
+          uci set system.@system[0].hostname='RAX3000M'
+          uci set system.@system[0].timezone='CST-8'
+          uci set system.@system[0].zonename='Asia/Shanghai'
+          uci commit system
+          uci set firewall.@defaults[0].forward='ACCEPT'
+          uci set firewall.@defaults[0].flow_offloading='0'
+          uci set firewall.@defaults[0].flow_offloading_hw='0'
+          uci commit firewall
+          uci -q set honk.config.enabled='0'
+          uci commit honk
+          /etc/init.d/odhcpd disable 2>/dev/null
+          exit 0
+          EOF
+          chmod 0755 files/etc/uci-defaults/99zz-bypass-zh
+          cat > files/etc/uci-defaults/99zz-mesh-ap <<'MESHEOF'
+          #!/bin/sh
+          # Wired-mesh AP preset: mirror the main router's 5G SSID for same-SSID roaming.
+          # Main router: alizhi-5G, WPA2/WPA3 mixed, ch36, country US. This node: ch149 (no overlap).
+          [ -n "$IPKG_INSTROOT" ] && exit 0
+          KEY='__WIFI_KEY__'
+          R5=''
+          i=0
+          while uci -q get wireless.radio$i >/dev/null; do
+              [ "$(uci -q get wireless.radio$i.band)" = '5g' ] && R5="radio$i"
+              i=$((i+1))
+          done
+          [ -n "$R5" ] || R5='radio1'
+          uci -q get wireless.$R5 >/dev/null || exit 0
+          uci set wireless.$R5.country='US'
+          uci set wireless.$R5.channel='149'
+          uci set wireless.$R5.htmode='HE80'
+          uci set wireless.$R5.disabled='0'
+          IF=''
+          for s in $(uci show wireless | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)=wifi-iface$/\1/p'); do
+              [ "$(uci -q get wireless.$s.device)" = "$R5" ] && IF="$s"
+          done
+          if [ -z "$IF" ]; then
+              uci set wireless.mesh5g='wifi-iface'
+              IF='mesh5g'
+              uci set wireless.$IF.device="$R5"
+          fi
+          uci set wireless.$IF.network='lan'
+          uci set wireless.$IF.mode='ap'
+          uci set wireless.$IF.ssid='alizhi-5G'
+          uci set wireless.$IF.encryption='sae-mixed'
+          uci set wireless.$IF.key="$KEY"
+          uci set wireless.$IF.disabled='0'
+          uci set wireless.$IF.ieee80211r='1'
+          uci set wireless.$IF.mobility_domain='4f57'
+          uci set wireless.$IF.ft_over_ds='1'
+          uci set wireless.$IF.ieee80211k='1'
+          uci set wireless.$IF.ieee80211v='1'
+          uci commit wireless
+          exit 0
+          MESHEOF
+          chmod 0755 files/etc/uci-defaults/99zz-mesh-ap
+          sed -i "s/__WIFI_KEY__/${WIFI_KEY:-Mesh12345}/" files/etc/uci-defaults/99zz-mesh-ap
+          printf '%s\n' 'net.ipv6.conf.all.disable_ipv6=1' 'net.ipv6.conf.default.disable_ipv6=1' 'net.ipv4.ip_forward=1' 'net.ipv4.conf.all.send_redirects=0' 'net.ipv4.conf.default.send_redirects=0' > files/etc/sysctl.d/99-bypass.conf
+          cp .config ../dist/build.config
+      - name: Download and compile
+        run: |
+          set -o pipefail
+          cd openwrt
+          make download -j8
+          make -j2 2>&1 | tee build.log || make -j1 V=s 2>&1 | tee -a build.log
+      - name: Verify and collect firmware
+        run: |
+          set -euxo pipefail
+          out=openwrt/bin/targets/mediatek/filogic
+          image=$(find "$out" -maxdepth 1 -name '*cmcc_rax3000m-squashfs-sysupgrade.itb' -print -quit)
+          test -n "$image"
+          manifest="${image%-sysupgrade.itb}.manifest"
+          if [ ! -f "$manifest" ]; then manifest=$(find "$out" -maxdepth 1 -name '*cmcc_rax3000m*.manifest' -print -quit); fi
+          test -s "$manifest"
+          for p in honk luci-app-honk luci-i18n-daeuniverse-zh-cn luci-theme-argon usteer luci-app-usteer; do
+            grep -q "^$p - " "$manifest" || { echo "Not installed: $p"; exit 1; }
+          done
+          if grep -Eq '^(dae|luci-app-dae) - ' "$manifest"; then
+            echo 'Unexpected dae package in firmware'; exit 1
+          fi
+          cp "$image" "$manifest" dist/
+          find "$out" -maxdepth 1 -name '*cmcc_rax3000m*recovery.itb' -exec cp '{}' dist/ \;
+          printf '%s\n' 'RAX3000M NAND Chinese bypass build - honk only + wired mesh AP' 'LAN: 192.168.0.2/24; upstream gateway and DNS: 192.168.0.1.' 'Connect LAN to LAN. DHCP server and IPv6 networking disabled.' 'Argon theme; Simplified Chinese LuCI and official daeuniverse translation.' 'Only honk is installed; dae and luci-app-dae are excluded and checked absent.' 'honk is stopped by default; configure it before enabling.' 'Mesh AP: 5G mirrors SSID alizhi-5G, channel 149, WPA2/WPA3 mixed, 802.11k/v/r fast roaming, mobility domain 4f57, usteer installed. WiFi password comes from the WIFI_KEY repo secret; if unset the temporary password is Mesh12345 - change it in LuCI after first login.' 'Kernel IPv6 code may remain for dependencies; IPv6 networking is disabled at runtime.' 'No hardware boot or forwarding test has been performed.' 'Back up the router and check NAND partition/U-Boot compatibility before flashing.' 'Use a clean configuration for these defaults; retained settings can override them.' 'Set an administrator password at first login. No subscription or credentials are embedded.' 'Hardware NAT compatibility with eBPF must be tested on the device; firewall flow offload is disabled.' 'The requested blog was inaccessible; this build uses official daeuniverse packages, not a verified reproduction of that blog.' > dist/README.txt
+          (cd dist && sha256sum *.itb > sha256sums)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rax3000m-nand-honk-mesh-bypass-zh
+          path: dist/
+          retention-days: 14
+      - name: Publish separate release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: honk-mesh-bypass-zh-${{ github.run_id }}
+          name: RAX3000M NAND Honk Mesh Chinese Bypass ${{ github.run_number }}
+          body_path: dist/README.txt
+          files: dist/*
+      - name: Preserve failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bypass-zh-debug-${{ github.run_id }}
+          path: |
+            openwrt/build.log
+            openwrt/logs/
+            openwrt/.config
+            dist/source-commits.txt
+          if-no-files-found: ignore
+          retention-days: 7
