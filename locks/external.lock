@@ -6,7 +6,7 @@ COUNT=3
 
 PKG_1_NAME=luci-app-oxidns
 PKG_1_REPO=https://github.com/svenshi/luci-app-oxidns
-PKG_1_COMMIT=bf12212d10f9a6d2c4dbba12088701849d44d9d8
+PKG_1_COMMIT=f37dbbd396990553f0ef4c7b8916f5cb5103e1f1
 PKG_1_DEST=package/new/luci-app-oxidns
 
 PKG_2_NAME=openwrt-nikki
